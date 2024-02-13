@@ -1,6 +1,6 @@
 script_name = "Identify Overlaps"
 script_description = "Identify time overlaps in lines with the same dialogue style"
-script_version = "1.1"
+script_version = "1.2"
 script_author = "Animorphs"
 
 function check_style(style)
@@ -14,12 +14,13 @@ function check_style(style)
 end
 
 function identify_overlaps(subs, sel)
+    local overlap_count = 0
     for i = 1, #subs do
         local current_line = subs[i]
-        if current_line.class == "dialogue" and check_style(current_line.style) then
+        if current_line.class == "dialogue" and check_style(current_line.style) and not current_line.comment then
             for j = i + 1, #subs do
                 local next_line = subs[j]
-                if next_line.class == "dialogue" and next_line.style == current_line.style then -- ensure exclusion of alt styles and such
+                if next_line.class == "dialogue" and next_line.style == current_line.style and not next_line.comment then -- ensure exclusion of alt styles and such
                     if current_line.start_time < next_line.end_time and next_line.start_time < current_line.end_time then
                         local both_an8 =
                             string.find(current_line.text, "\\an8") and string.find(next_line.text, "\\an8")
@@ -29,9 +30,11 @@ function identify_overlaps(subs, sel)
                         if both_an8 or neither_an8 then
                             if not string.find(current_line.effect, "%[Overlap%]") then
                                 current_line.effect = "[Overlap] " .. current_line.effect
+                                overlap_count = overlap_count + 1
                             end
                             if not string.find(next_line.effect, "%[Overlap%]") then
                                 next_line.effect = "[Overlap] " .. next_line.effect
+                                overlap_count = overlap_count + 1
                             end
 
                             subs[i] = current_line
@@ -42,7 +45,12 @@ function identify_overlaps(subs, sel)
             end
         end
     end
-
+    
+    if overlap_count > 0 then
+        aegisub.debug.out("Added [overlap] to " .. overlap_count .. " lines.\n")
+    else
+        aegisub.debug.out("No overlaps found.\n")
+    end
     aegisub.set_undo_point(script_name)
 end
 
