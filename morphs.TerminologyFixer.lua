@@ -1,6 +1,6 @@
 script_name = "Terminology Fixer"
 script_description = "Fix names and other terminology"
-script_version = "1.1"
+script_version = "1.2"
 script_author = "Animorphs"
 
 local function get_user_path()
@@ -278,14 +278,35 @@ local HONORIFIC_TERMS = {
     "sensei", "senpai"
 }
 
+local DELETE_SENTINEL = "{delete}"
+
+local function decode_replacement_value(value)
+    if value == DELETE_SENTINEL then
+        return ""
+    end
+    return value
+end
+
+local function encode_replacement_value(value)
+    if value == "" then
+        return DELETE_SENTINEL
+    end
+    return value
+end
+
 local function build_example_section_template(op)
     op = op or "->"
     return table.concat({
-        "### Character names",
+        "### Character Names",
         "Yagami Raito " .. op .. " Light Yagami",
         "Amane Misa " .. op .. " Misa Amane",
         "",
-        "### Term swaps",
+        "### Honorifics",
+        "Light-sama " .. op .. "{*}Master Light{*Light-sama}",
+        "Misa-chan " .. op .. " Misa{**-chan}",
+        "-kun " .. op .. " " .. DELETE_SENTINEL,
+        "",
+        "### Other Terms",
         "Shinigami " .. op .. " Grim Reaper",
         "SPK " .. op .. " Special Provision for Kira"
     }, "\n")
@@ -305,7 +326,7 @@ local function serialize_show_data(show_data, op)
             lines[#lines + 1] = "### " .. section.name
         end
         for _, old in ipairs(sorted_keys(section.replacements)) do
-            lines[#lines + 1] = old .. " " .. op .. " " .. section.replacements[old]
+            lines[#lines + 1] = old .. " " .. op .. " " .. encode_replacement_value(section.replacements[old])
         end
         if #lines > 0 then
             blocks[#blocks + 1] = table.concat(lines, "\n")
@@ -314,7 +335,26 @@ local function serialize_show_data(show_data, op)
     return table.concat(blocks, "\n\n")
 end
 
-local function parse_show_data(text, style_filter_text, op)
+local function normalize_rule_key(term, case_sensitive)
+    return case_sensitive and term or term:lower()
+end
+
+local function format_section_label(section_name)
+    if section_name and section_name ~= "" then
+        return "### " .. section_name
+    end
+    return nil
+end
+
+local function format_rule_display(section_name, old, new, op)
+    local section_label = format_section_label(section_name)
+    if section_label then
+        return "    " .. section_label .. ": " .. old .. " " .. op .. " " .. new
+    end
+    return "    " .. old .. " " .. op .. " " .. new
+end
+
+local function parse_show_data(text, style_filter_text, op, case_sensitive)
     local sections = {}
     local current = nil
     local op_pat = escape_lua_pattern(op)
@@ -322,7 +362,7 @@ local function parse_show_data(text, style_filter_text, op)
 
     local function ensure_current_section()
         if not current then
-            current = {name = nil, replacements = {}}
+            current = {name = nil, replacements = {}, replacement_keys = {}}
             sections[#sections + 1] = current
         end
         return current
@@ -333,7 +373,7 @@ local function parse_show_data(text, style_filter_text, op)
         if trimmed ~= "" then
             local header = trimmed:match("^###%s*(.-)%s*$")
             if header ~= nil then
-                current = {name = trim(header), replacements = {}}
+                current = {name = trim(header), replacements = {}, replacement_keys = {}}
                 if current.name == "" then
                     current.name = nil
                 end
@@ -341,14 +381,23 @@ local function parse_show_data(text, style_filter_text, op)
             else
                 local old, new = trimmed:match("^(.-)%s*" .. op_pat .. "%s*(.-)%s*$")
                 if old and new and old ~= "" then
-                    ensure_current_section().replacements[old] = new
+                    local section = ensure_current_section()
+                    local old_key = normalize_rule_key(old, case_sensitive)
+                    if not section.replacement_keys[old_key] then
+                        section.replacements[old] = decode_replacement_value(new)
+                        section.replacement_keys[old_key] = old
+                    end
                 end
             end
         end
     end
 
     if #sections == 0 then
-        sections[1] = {name = nil, replacements = {}}
+        sections[1] = {name = nil, replacements = {}, replacement_keys = {}}
+    end
+
+    for i = 1, #sections do
+        sections[i].replacement_keys = nil
     end
 
     return {
@@ -357,32 +406,88 @@ local function parse_show_data(text, style_filter_text, op)
     }
 end
 
-local function validate_replacements(text, op)
+local function validate_replacements(text, op, case_sensitive)
     local errors = {}
-    local line_no = 0
     local op_pat = escape_lua_pattern(op)
     local normalized_text = (text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    local current_section_index = 0
+    local current_section_name = nil
+    local seen_rules = {}
+
+    local function ensure_default_section()
+        if current_section_index == 0 then
+            current_section_index = 1
+            current_section_name = nil
+        end
+    end
 
     for line in (normalized_text .. "\n"):gmatch("(.-)\n") do
-        line_no = line_no + 1
         local trimmed = trim(line)
         if trimmed ~= "" then
             local header = trimmed:match("^###%s*(.-)%s*$")
             if header ~= nil then
                 if trim(header) == "" then
-                    errors[#errors + 1] = "Line " .. line_no .. ": Section headers must have a name.\n\tCurrent line: " .. trimmed .. "\n"
+                    errors[#errors + 1] = "Section header is missing a name:\n" .. trimmed
+                else
+                    current_section_index = current_section_index + 1
+                    current_section_name = trim(header)
                 end
             else
                 local old, new = trimmed:match("^(.-)%s*" .. op_pat .. "%s*(.-)%s*$")
-                if not old or not new or old == "" or new == "" then
-                    errors[#errors + 1] = "Line " .. line_no .. ": Incorrect syntax. Each line must be \"term1 " .. op .. " term2\".\n\tCurrent line: " .. trimmed .. "\n"
-                elseif old == new then
-                    errors[#errors + 1] = "Line " .. line_no .. ": Identical terms defined.\n\tCurrent line: " .. trimmed .. "\n"
+                local decoded_new = new and decode_replacement_value(new) or nil
+                if not old or new == nil or old == "" or (new == "" and decoded_new == "") then
+                    errors[#errors + 1] = "Invalid replacement syntax:\n" .. trimmed .. "\nExpected format: old " .. op .. " new"
+                elseif old == decoded_new then
+                    ensure_default_section()
+                    errors[#errors + 1] = "Replacement maps a term to itself:\n" .. format_rule_display(current_section_name, old, encode_replacement_value(decoded_new), op)
+                else
+                    ensure_default_section()
+                    local old_key = normalize_rule_key(old, case_sensitive)
+                    local seen = seen_rules[old_key]
+
+                    if not seen then
+                        seen_rules[old_key] = {
+                            old = old,
+                            new = decoded_new,
+                            section_index = current_section_index,
+                            section_name = current_section_name
+                        }
+                    elseif seen.section_index == current_section_index then
+                        if seen.new ~= decoded_new then
+                            errors[#errors + 1] = "Conflicting replacements in the same section:\n"
+                                .. format_rule_display(seen.section_name, seen.old, encode_replacement_value(seen.new), op) .. "\n"
+                                .. format_rule_display(current_section_name, old, encode_replacement_value(decoded_new), op)
+                        end
+                    else
+                        if seen.new == decoded_new then
+                            errors[#errors + 1] = "Duplicate replacement appears in multiple sections:\n"
+                                .. format_rule_display(seen.section_name, seen.old, encode_replacement_value(seen.new), op) .. "\n"
+                                .. format_rule_display(current_section_name, old, encode_replacement_value(decoded_new), op)
+                        else
+                            errors[#errors + 1] = "Conflicting replacements across sections:\n"
+                                .. format_rule_display(seen.section_name, seen.old, encode_replacement_value(seen.new), op) .. "\n"
+                                .. format_rule_display(current_section_name, old, encode_replacement_value(decoded_new), op)
+                        end
+                    end
                 end
             end
         end
     end
     return #errors == 0, errors
+end
+
+local function show_validation_errors(errors)
+    local message = table.concat(errors or {}, "\n\n")
+    local line_count = 1
+    for _ in message:gmatch("\n") do
+        line_count = line_count + 1
+    end
+    local height = math.max(6, math.min(18, line_count))
+
+    aegisub.dialog.display({
+        {class = "textbox", name = "validation_errors", value = message,
+            x = 0, y = 0, width = 78, height = height}
+    }, {"OK"})
 end
 
 local function get_show_names(cfg)
@@ -444,20 +549,87 @@ local function is_word_char(ch)
     return ch ~= "" and ch:match("[%w]") ~= nil
 end
 
+local function get_special_sequence_at(text, idx)
+    if idx < 1 or idx + 1 > #text then
+        return nil
+    end
+    local seq = text:sub(idx, idx + 1)
+    if seq == "\\N" or seq == "\\n" or seq == "\\h" then
+        return seq
+    end
+    return nil
+end
+
+local function chars_equal(a, b, case_sensitive)
+    if case_sensitive then
+        return a == b
+    end
+    return a:lower() == b:lower()
+end
+
 local function is_special_boundary_left(text, start_idx)
     if start_idx <= 2 then
         return false
     end
-    local seq = text:sub(start_idx - 2, start_idx - 1)
-    return seq == "\\N" or seq == "\\n" or seq == "\\h"
+    return get_special_sequence_at(text, start_idx - 2) ~= nil
 end
 
 local function is_special_boundary_right(text, end_idx)
     if end_idx + 2 > #text then
         return false
     end
-    local seq = text:sub(end_idx + 1, end_idx + 2)
-    return seq == "\\N" or seq == "\\n" or seq == "\\h"
+    return get_special_sequence_at(text, end_idx + 1) ~= nil
+end
+
+local function match_term_at(text, term, start_idx, case_sensitive)
+    local text_pos = start_idx
+    local term_pos = 1
+    local removed_separators = {}
+
+    while term_pos <= #term do
+        local term_char = term:sub(term_pos, term_pos)
+
+        if term_char == " " then
+            local matched_separator = false
+
+            while text_pos <= #text do
+                local seq = get_special_sequence_at(text, text_pos)
+                if seq then
+                    matched_separator = true
+                    removed_separators[seq] = true
+                    text_pos = text_pos + 2
+                else
+                    local text_char = text:sub(text_pos, text_pos)
+                    if text_char ~= " " then
+                        break
+                    end
+                    matched_separator = true
+                    text_pos = text_pos + 1
+                end
+            end
+
+            if not matched_separator then
+                return nil
+            end
+        else
+            if text_pos > #text then
+                return nil
+            end
+
+            local text_char = text:sub(text_pos, text_pos)
+            if not chars_equal(term_char, text_char, case_sensitive) then
+                return nil
+            end
+            text_pos = text_pos + 1
+        end
+
+        term_pos = term_pos + 1
+    end
+
+    return {
+        end_idx = text_pos - 1,
+        removed_separators = removed_separators
+    }
 end
 
 local function has_word_boundaries(text, start_idx, end_idx, term)
@@ -500,10 +672,15 @@ local function build_rules(show_data, case_sensitive)
         for _, old in ipairs(sorted_keys(section.replacements)) do
             index = index + 1
             local new = section.replacements[old]
+            local first_space = old:find(" ", 1, true)
+            local anchor = first_space and old:sub(1, first_space - 1) or old
             rules[#rules + 1] = {
                 old = old,
                 new = new,
                 old_cmp = case_sensitive and old or old:lower(),
+                anchor = anchor,
+                anchor_cmp = case_sensitive and anchor or anchor:lower(),
+                flexible_separators = first_space ~= nil,
                 index = index
             }
         end
@@ -531,16 +708,38 @@ local function find_next_rule_match(text, rules, case_sensitive, whole_word, sta
     for _, rule in ipairs(rules) do
         local find_pos = start_pos
         while true do
-            local s, e = cmp_text:find(rule.old_cmp, find_pos, true)
+            local s, e
+            if rule.flexible_separators then
+                s, e = cmp_text:find(rule.anchor_cmp, find_pos, true)
+            else
+                s, e = cmp_text:find(rule.old_cmp, find_pos, true)
+            end
+
             if not s then
                 break
             end
-            if boundary_matches(text, s, e, rule.old, whole_word) then
+
+            local term_match
+            if rule.flexible_separators then
+                term_match = match_term_at(text, rule.old, s, case_sensitive)
+            else
+                term_match = {
+                    end_idx = e,
+                    removed_separators = {}
+                }
+            end
+
+            if term_match and boundary_matches(text, s, term_match.end_idx, rule.old, whole_word) then
                 if not best_match
                     or s < best_match.start_idx
                     or (s == best_match.start_idx and #rule.old > #best_match.rule.old)
                     or (s == best_match.start_idx and #rule.old == #best_match.rule.old and rule.index < best_match.rule.index) then
-                    best_match = {start_idx = s, end_idx = e, rule = rule}
+                    best_match = {
+                        start_idx = s,
+                        end_idx = term_match.end_idx,
+                        removed_separators = term_match.removed_separators,
+                        rule = rule
+                    }
                 end
                 break
             end
@@ -551,32 +750,6 @@ local function find_next_rule_match(text, rules, case_sensitive, whole_word, sta
     return best_match
 end
 
-local function replace_literal_term(text, term, replacement, case_sensitive, whole_word)
-    local out = {}
-    local pos = 1
-    local cmp_text = case_sensitive and text or text:lower()
-    local cmp_term = case_sensitive and term or term:lower()
-
-    while pos <= #text do
-        local s, e = cmp_text:find(cmp_term, pos, true)
-        if not s then
-            out[#out + 1] = text:sub(pos)
-            break
-        end
-
-        if boundary_matches(text, s, e, term, whole_word) then
-            out[#out + 1] = text:sub(pos, s - 1)
-            out[#out + 1] = replacement
-            pos = e + 1
-        else
-            out[#out + 1] = text:sub(pos, s)
-            pos = s + 1
-        end
-    end
-
-    return table.concat(out)
-end
-
 local function text_has_match(text, rules, case_sensitive, whole_word)
     return find_next_rule_match(text, rules, case_sensitive, whole_word, 1) ~= nil
 end
@@ -584,18 +757,57 @@ end
 local function protect_existing_replacements(text, rules, case_sensitive, whole_word)
     local protected = {}
     local protected_text = text
+    local protection_rules = {}
 
     for _, rule in ipairs(rules) do
         if text_has_match(rule.new, rules, case_sensitive, whole_word) then
-            local token = string.char(30) .. "TERM_FIXER_" .. tostring(#protected + 1) .. string.char(31)
-            local updated = replace_literal_term(protected_text, rule.new, token, true, whole_word)
-            if updated ~= protected_text then
-                protected[#protected + 1] = {
-                    token = token,
-                    value = rule.new
-                }
-                protected_text = updated
+            protection_rules[#protection_rules + 1] = rule
+        end
+    end
+
+    table.sort(protection_rules, function(a, b)
+        if #a.new ~= #b.new then
+            return #a.new > #b.new
+        end
+        local a_lower = a.new:lower()
+        local b_lower = b.new:lower()
+        if a_lower ~= b_lower then
+            return a_lower < b_lower
+        end
+        return a.index < b.index
+    end)
+
+    for _, rule in ipairs(protection_rules) do
+        local temp_rule = {
+            old = rule.new,
+            new = rule.new,
+            old_cmp = case_sensitive and rule.new or rule.new:lower(),
+            index = rule.index
+        }
+        local out = {}
+        local pos = 1
+        local changed = false
+
+        while pos <= #protected_text do
+            local match = find_next_rule_match(protected_text, {temp_rule}, case_sensitive, whole_word, pos)
+            if not match then
+                out[#out + 1] = protected_text:sub(pos)
+                break
             end
+
+            local token = string.char(30) .. "TERM_FIXER_" .. tostring(#protected + 1) .. string.char(31)
+            out[#out + 1] = protected_text:sub(pos, match.start_idx - 1)
+            out[#out + 1] = token
+            protected[#protected + 1] = {
+                token = token,
+                value = protected_text:sub(match.start_idx, match.end_idx)
+            }
+            pos = match.end_idx + 1
+            changed = true
+        end
+
+        if changed then
+            protected_text = table.concat(out)
         end
     end
 
@@ -612,13 +824,14 @@ end
 
 local function apply_rules_to_text(text, rules, case_sensitive, whole_word)
     if #rules == 0 or text == "" then
-        return text, false
+        return text, 0, {}
     end
 
     local protected_text, protected = protect_existing_replacements(text, rules, case_sensitive, whole_word)
     local out = {}
     local pos = 1
-    local changed = false
+    local change_count = 0
+    local removed_separators = {}
 
     while pos <= #protected_text do
         local match = find_next_rule_match(protected_text, rules, case_sensitive, whole_word, pos)
@@ -628,33 +841,126 @@ local function apply_rules_to_text(text, rules, case_sensitive, whole_word)
         end
         out[#out + 1] = protected_text:sub(pos, match.start_idx - 1)
         out[#out + 1] = match.rule.new
-        changed = true
+        change_count = change_count + 1
+        for seq, present in pairs(match.removed_separators or {}) do
+            if present then
+                removed_separators[seq] = true
+            end
+        end
         pos = match.end_idx + 1
     end
 
     local restored = restore_protected_replacements(table.concat(out), protected)
-    return restored, changed
+    return restored, change_count, removed_separators
+end
+
+local function build_term_fix_tag(change_count)
+    if change_count <= 1 then
+        return "[term fix]"
+    end
+    return "[term fix x" .. tostring(change_count) .. "]"
+end
+
+local function build_removed_separator_tag(removed_separators)
+    local ordered = {"\\N", "\\n", "\\h"}
+    local found = {}
+
+    for _, seq in ipairs(ordered) do
+        if removed_separators and removed_separators[seq] then
+            found[#found + 1] = seq
+        end
+    end
+
+    if #found == 0 then
+        return nil
+    end
+    if #found == 1 then
+        return "[" .. found[1] .. " removed]"
+    end
+    if #found == 2 then
+        return "[" .. found[1] .. " and " .. found[2] .. " removed]"
+    end
+    return "[" .. found[1] .. ", " .. found[2] .. ", and " .. found[3] .. " removed]"
+end
+
+local function update_term_fix_effect(effect, change_count, removed_separators)
+    local cleaned = (effect or ""):gsub("%[term fix x%d+%]", "")
+    cleaned = cleaned:gsub("%[term fix%]", "")
+
+    cleaned = cleaned:gsub("%[\\N removed%]", "")
+    cleaned = cleaned:gsub("%[\\n removed%]", "")
+    cleaned = cleaned:gsub("%[\\h removed%]", "")
+    cleaned = cleaned:gsub("%[\\N and \\n removed%]", "")
+    cleaned = cleaned:gsub("%[\\N and \\h removed%]", "")
+    cleaned = cleaned:gsub("%[\\n and \\h removed%]", "")
+    cleaned = cleaned:gsub("%[\\N, \\n, and \\h removed%]", "")
+    local updated = cleaned .. build_term_fix_tag(change_count)
+    local removed_tag = build_removed_separator_tag(removed_separators)
+    if removed_tag then
+        updated = updated .. removed_tag
+    end
+    return updated
 end
 
 local function apply_replacements(subs, show_data, whole_word, case_sensitive, include_comments)
     local count = 0
+    show_data = normalize_show_data(show_data)
     local style_filters = show_data.styles or {}
-    local rules = build_rules(show_data, case_sensitive)
+    local section_rules = {}
+    local remaining_rules = {}
+
+    for i = 1, #show_data.sections do
+        local section = show_data.sections[i]
+        local remaining_sections = {}
+
+        section_rules[i] = build_rules({
+            sections = {
+                {
+                    name = section.name,
+                    replacements = section.replacements
+                }
+            }
+        }, case_sensitive)
+
+        for j = i, #show_data.sections do
+            remaining_sections[#remaining_sections + 1] = {
+                name = show_data.sections[j].name,
+                replacements = show_data.sections[j].replacements
+            }
+        end
+
+        remaining_rules[i] = build_rules({
+            sections = remaining_sections
+        }, case_sensitive)
+    end
 
     for i, line in ipairs(subs) do
         if line.class == "dialogue" then
             local is_comment = line.comment == true
             if (include_comments or not is_comment) and style_matches_filters(line.style, style_filters) then
                 local original_text = line.text or ""
-                local modified_text, changed = apply_rules_to_text(original_text, rules, case_sensitive, whole_word)
+                local modified_text = original_text
+                local line_change_count = 0
+                local line_removed_separators = {}
 
-                if changed and modified_text ~= original_text then
+                for section_idx, rules in ipairs(section_rules) do
+                    local protected_text, protected = protect_existing_replacements(modified_text, remaining_rules[section_idx], case_sensitive, whole_word)
+                    local section_change_count
+                    local section_removed_separators
+                    protected_text, section_change_count, section_removed_separators = apply_rules_to_text(protected_text, rules, case_sensitive, whole_word)
+                    modified_text = restore_protected_replacements(protected_text, protected)
+                    line_change_count = line_change_count + section_change_count
+                    for seq, present in pairs(section_removed_separators or {}) do
+                        if present then
+                            line_removed_separators[seq] = true
+                        end
+                    end
+                end
+
+                if line_change_count > 0 and modified_text ~= original_text then
                     line.text = modified_text
 
-                    local effect = line.effect or ""
-                    if not effect:match("%[term fix%]") then
-                        line.effect = effect .. "[term fix]"
-                    end
+                    line.effect = update_term_fix_effect(line.effect or "", line_change_count, line_removed_separators)
 
                     subs[i] = line
                     count = count + 1
@@ -698,15 +1004,15 @@ end
 
 local function make_dialog(state)
     local show_label = state.show_name or "(none)"
-    local styles_hint = "Blank means all styles. Use comma-separated partial style names, for example: Default, signs - animorphs."
+    local styles_hint = "Restrict swapping to specific styles. Blank means all styles. Use comma-separated partial style names, for example: Default, Overlap."
     if state.available_styles and #state.available_styles > 0 then
-        styles_hint = styles_hint .. " Available: " .. table.concat(state.available_styles, ", ")
+        styles_hint = styles_hint .. "\nStyles in this file: " .. table.concat(state.available_styles, ", ")
     end
 
     local dialog = {
         {class = "label", label = show_label, x = 0, y = 0, width = 50, height = 1},
         {class = "textbox", name = "list_text", value = state.list_text or "", x = 0, y = 1, width = 50, height = 27},
-        {class = "checkbox", name = "whole_word", label = "Whole-word match", value = state.whole_word, hint = "When on, only whole words are replaced. \\N, \\n, and \\h count as word boundaries.", x = 0, y = 28, width = 12, height = 1},
+        {class = "checkbox", name = "whole_word", label = "Whole-word match", value = state.whole_word, hint = "When on, only whole words are replaced. \\N, \\n, and \\h count as word boundaries, and spaces inside rules can match them too.", x = 0, y = 28, width = 12, height = 1},
         {class = "checkbox", name = "case_sensitive", label = "Case-sensitive", value = state.case_sensitive, hint = "When on, matches must use the same capitalization.", x = 13, y = 28, width = 12, height = 1},
         {class = "checkbox", name = "include_comments", label = "Include comments", value = state.include_comments, hint = "When on, commented lines are also processed.", x = 25, y = 28, width = 12, height = 1},
         {class = "checkbox", name = "scan_honorifics", label = "Flag honorifics", value = state.scan_honorifics, hint = "When on, lines containing honorifics (processed after the swaps occur) like -san or -chan are marked in Effect.", x = 37, y = 28, width = 12, height = 1},
@@ -790,19 +1096,31 @@ end
 
 local function help_dialog(op)
     local dialog = {
-        {class = "label", label = "Replacements are one per line: old phrase, then \"" .. op .. "\", then new phrase.", x = 0, y = 0, width = 10, height = 1},
-        {class = "label", label = "You can keep different terminology lists per show and optionally split them into sections with lines like \"### Honorifics swap\".", x = 0, y = 1, width = 10, height = 1},
-        {class = "label", label = "Sections stay in the order you write them, and entries sort alphabetically inside each section.", x = 0, y = 2, width = 10, height = 1},
-        {class = "label", label = "Styles are optional and comma-separated. Blank means all styles. Each value is an includes match against the style name, for example: Default, Overlap.", x = 0, y = 3, width = 10, height = 1},
-        {class = "label", label = "\"Include comments\" decides whether commented lines are processed too.", x = 0, y = 4, width = 10, height = 1},
-        {class = "label", label = "", x = 0, y = 5, width = 10, height = 1},
-        {class = "label", label = "Examples:", x = 0, y = 6, width = 10, height = 1},
-        {class = "label", label = "### Character Names", x = 0, y = 7, width = 10, height = 1},
-        {class = "label", label = "Yagami Raito " .. op .. " Light Yagami", x = 0, y = 8, width = 10, height = 1},
-        {class = "label", label = "Amane Misa " .. op .. " Misa Amane", x = 0, y = 9, width = 10, height = 1},
-        {class = "label", label = "### Term swaps", x = 0, y = 10, width = 10, height = 1},
-        {class = "label", label = "Shinigami " .. op .. " Grim Reaper", x = 0, y = 11, width = 10, height = 1},
-        {class = "label", label = "SPK " .. op .. " Special Provision for Kira", x = 0, y = 12, width = 10, height = 1}
+        {class = "label", label = "Replacements are one per line: old phrase, then \"" .. op .. "\", then new phrase. Use " .. DELETE_SENTINEL .. " to delete matched text. See examples below.", x = 0, y = 0, width = 10, height = 1},
+        {class = "label", label = "", x = 0, y = 1, width = 10, height = 1},
+        {class = "label", label = "You can keep different terminology lists per show and optionally split them into sections with three hashes, like this: \"### Honorifics\".", x = 0, y = 2, width = 10, height = 1},
+        {class = "label", label = "Sections stay in the order you write them, and entries sort alphabetically inside each section.", x = 0, y = 3, width = 10, height = 1},
+        {class = "label", label = "Replacements happen in order of sections, so put each stage in its own ### block. ", x = 0, y = 4, width = 10, height = 1},
+        {class = "label", label = "    E.g., if you want to run the Character Names swap before the Honorifics swap, ensure that the Character Names section comes before it.", x = 0, y = 5, width = 10, height = 1},
+        {class = "label", label = "", x = 0, y = 6, width = 10, height = 1},
+        {class = "label", label = "\"Whole-word match\" decides whether replacements are restricted to whole words. \\N, \\n, and \\h count as word boundaries, and spaces inside rules can match them too.", x = 0, y = 7, width = 10, height = 1},
+        {class = "label", label = "\"Case-sensitive\" decides whether matches must use the same capitalization.", x = 0, y = 8, width = 10, height = 1},
+        {class = "label", label = "\"Include comments\" decides whether commented lines are processed too.", x = 0, y = 9, width = 10, height = 1},
+        {class = "label", label = "\"Flag honorifics\" decides whether lines containing honorifics like -san or -chan are marked in Effect after the replacements are done.", x = 0, y = 10, width = 10, height = 1},
+        {class = "label", label = "\"Styles\" restricts swapping to specific styles. Blank means all styles. Use comma-separated partial style names, for example: Default, Overlap.", x = 0, y = 11, width = 10, height = 1},
+        {class = "label", label = "", x = 0, y = 12, width = 10, height = 1},
+        {class = "label", label = "", x = 0, y = 13, width = 10, height = 1},
+        {class = "label", label = "Examples:", x = 0, y = 14, width = 10, height = 1},
+        {class = "label", label = "### Character Names", x = 0, y = 15, width = 10, height = 1},
+        {class = "label", label = "Yagami Raito " .. op .. " Light Yagami", x = 0, y = 16, width = 10, height = 1},
+        {class = "label", label = "Amane Misa " .. op .. " Misa Amane", x = 0, y = 17, width = 10, height = 1},
+        {class = "label", label = "### Honorifics", x = 0, y = 18, width = 10, height = 1},
+        {class = "label", label = "Light-sama " .. op .. "{*}Master Light{*Light-sama}", x = 0, y = 19, width = 10, height = 1},
+        {class = "label", label = "Misa-chan " .. op .. " Misa{**-chan}", x = 0, y = 20, width = 10, height = 1},
+        {class = "label", label = "-kun " .. op .. " " .. DELETE_SENTINEL, x = 0, y = 21, width = 10, height = 1},
+        {class = "label", label = "### Other Terms", x = 0, y = 22, width = 14, height = 1},
+        {class = "label", label = "Shinigami " .. op .. " Grim Reaper", x = 0, y = 23, width = 15, height = 1},
+        {class = "label", label = "SPK " .. op .. " Special Provision for Kira", x = 0, y = 24, width = 16, height = 1}
     }
     aegisub.dialog.display(dialog, {"OK"})
 end
@@ -861,22 +1179,21 @@ function replace_words(subs, sel)
             local old_op = state.last_mapping_op or state.mapping_op
             local new_op = operator_dialog(old_op)
             if new_op and new_op ~= old_op then
-                local ok_old, err_old = validate_replacements(state.list_text or "", old_op)
+                local ok_old, err_old = validate_replacements(state.list_text or "", old_op, state.case_sensitive)
                 if ok_old then
-                    local converted = parse_show_data(state.list_text or "", state.style_filter_text or "", old_op)
+                    local converted = parse_show_data(state.list_text or "", state.style_filter_text or "", old_op, state.case_sensitive)
                     state.list_text = serialize_show_data(converted, new_op)
                     state.mapping_op = new_op
                     state.last_mapping_op = new_op
                     cfg.mapping_op = new_op
                 else
-                    local ok_new, _ = validate_replacements(state.list_text or "", new_op)
+                    local ok_new, _ = validate_replacements(state.list_text or "", new_op, state.case_sensitive)
                     if ok_new then
                         state.mapping_op = new_op
                         state.last_mapping_op = new_op
                         cfg.mapping_op = new_op
                     else
-                        local msg = table.concat(err_old, "\n")
-                        aegisub.dialog.display({{class = "label", label = msg, x = 0, y = 0, width = 1, height = 1}})
+                        show_validation_errors(err_old)
                     end
                 end
             end
@@ -903,10 +1220,9 @@ function replace_words(subs, sel)
         end
 
         if button == "Save" then
-            local ok, errors = validate_replacements(state.list_text or "", state.mapping_op)
+            local ok, errors = validate_replacements(state.list_text or "", state.mapping_op, state.case_sensitive)
             if not ok then
-                local msg = table.concat(errors, "\n")
-                aegisub.dialog.display({{class = "label", label = msg, x = 0, y = 0, width = 1, height = 1}})
+                show_validation_errors(errors)
                 button = nil
             else
                 local target = ensure_show_name_for_action(cfg, state)
@@ -914,7 +1230,7 @@ function replace_words(subs, sel)
                     button = nil
                 else
                     ensure_show(cfg, target)
-                    cfg.shows[target] = parse_show_data(state.list_text or "", state.style_filter_text or "", state.mapping_op)
+                    cfg.shows[target] = parse_show_data(state.list_text or "", state.style_filter_text or "", state.mapping_op, state.case_sensitive)
                     cfg.last_show = target
                     save_config(cfg)
                     state.last_show = target
@@ -935,7 +1251,7 @@ function replace_words(subs, sel)
                 else
                     seed_text = build_example_section_template(state.mapping_op)
                 end
-                cfg.shows[target] = parse_show_data(seed_text, "", state.mapping_op)
+                cfg.shows[target] = parse_show_data(seed_text, "", state.mapping_op, state.case_sensitive)
                 state.show_name = target
                 state.last_show = target
                 cfg.last_show = target
@@ -972,10 +1288,9 @@ function replace_words(subs, sel)
         end
 
         if button == "Run" then
-            local ok, errors = validate_replacements(state.list_text or "", state.mapping_op)
+            local ok, errors = validate_replacements(state.list_text or "", state.mapping_op, state.case_sensitive)
             if not ok then
-                local msg = table.concat(errors, "\n")
-                aegisub.dialog.display({{class = "label", label = msg, x = 0, y = 0, width = 1, height = 1}})
+                show_validation_errors(errors)
                 button = nil
             else
                 local target = ensure_show_name_for_action(cfg, state)
@@ -991,7 +1306,7 @@ function replace_words(subs, sel)
         state.list_text = serialize_show_data(get_show_data(cfg, show_name), state.mapping_op)
     end
 
-    local show_data = parse_show_data(state.list_text or "", state.style_filter_text or "", state.mapping_op)
+    local show_data = parse_show_data(state.list_text or "", state.style_filter_text or "", state.mapping_op, state.case_sensitive)
     if show_name and show_name ~= "" then
         ensure_show(cfg, show_name)
         cfg.shows[show_name] = show_data
